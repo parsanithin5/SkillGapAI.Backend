@@ -4,19 +4,45 @@ import json
 import datetime
 from typing import List
 from collections import Counter
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import PyPDF2
-from google import genai
-from motor.motor_asyncio import AsyncIOMotorClient
 
+from motor.motor_asyncio import AsyncIOMotorClient
+from mistralai import Mistral
+import re
+
+# --------------------------------------------------
+# LOAD ENV VARIABLES
+# --------------------------------------------------
 load_dotenv()
 
+def extract_json(text: str):
+    """
+    Safely extract JSON object from Mistral response
+    """
+    try:
+        # Remove markdown fences if present
+        text = text.replace("```json", "").replace("```", "").strip()
+
+        # Extract first JSON block
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise ValueError("No JSON object found in response")
+
+        return json.loads(match.group())
+    except Exception as e:
+        raise ValueError(f"Invalid JSON from Mistral: {e}")
+
+
+# --------------------------------------------------
+# FASTAPI APP
+# --------------------------------------------------
 app = FastAPI()
 
-# Enable CORS for React Frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,7 +51,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1. DEFINE DATA MODELS (For FastAPI Docs & Validation)
+# --------------------------------------------------
+# DATA MODELS
+# --------------------------------------------------
 class AnalysisData(BaseModel):
     extracted_skills: List[str]
     missing_skills: List[str]
@@ -34,64 +62,85 @@ class AnalysisData(BaseModel):
     project_ideas: List[str]
     roadmap: List[str]
 
-# 2. INITIALIZE CLIENTS
-API_KEY = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=API_KEY)
+# --------------------------------------------------
+# INITIALIZE MISTRAL CLIENT
+# --------------------------------------------------
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+mistral_client = Mistral(api_key=MISTRAL_API_KEY)
 
+# --------------------------------------------------
+# MONGODB SETUP
+# --------------------------------------------------
 MONGO_URI = os.getenv("MONGO_URI")
 db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client.skillgap_db
 collection = db.analysis_results
 
+# --------------------------------------------------
+# ROOT ENDPOINT
+# --------------------------------------------------
 @app.get("/")
 def read_root():
-    return {"status": "online", "message": "SkillGap AI Server is Running!"}
+    return {"status": "online", "message": "SkillGap AI Server is Running (Mistral)!"}
 
+# --------------------------------------------------
+# ANALYZE SKILLS ENDPOINT
+# --------------------------------------------------
 @app.post("/analyze-skills")
 async def analyze_skills(
     target_role: str = Form(...),
     resume_file: UploadFile = File(...)
 ):
     try:
-        # 3. EXTRACT TEXT FROM PDF
+        # 1. EXTRACT TEXT FROM PDF
         pdf_content = await resume_file.read()
         pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
         extracted_text = ""
+
         for page in pdf_reader.pages:
-            extracted_text += page.extract_text()
+            if page.extract_text():
+                extracted_text += page.extract_text()
 
-        # 4. IMPROVED AI PROMPT (Forcing content generation)
+        # 2. PROMPT
         prompt = f"""
-        Analyze this resume for the role: '{target_role}'.
-        Resume Content: {extracted_text}
-        
-        Return ONLY a JSON object with these EXACT keys:
-        - "extracted_skills": list of skills found
-        - "missing_skills": list of detailed at least 3 skills needed for this role
-        - "readiness_score": integer 0-100
-        - "recommended_resources": list of 4 specific basic Courses and tutorials in india
-        - "project_ideas": list of detailed 3 practical projects to build
-        - "roadmap": list of 3 clear steps to get hired
-        
-        Ensure no lists are empty.
-        """
+You are an AI career analyst.
 
-        # 5. CALL GEMINI 2.0 FLASH
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-            config={"response_mime_type": "application/json"}
+Analyze the following resume for the role: "{target_role}"
+
+Resume Content:
+{extracted_text}
+
+Return ONLY valid JSON with EXACT keys:
+- extracted_skills (list)
+- missing_skills (minimum 3)
+- readiness_score (0 to 100)
+- recommended_resources (4 beginner-friendly courses/tutorials in India)
+- project_ideas (3 practical project ideas)
+- roadmap (3 clear steps to get hired)
+
+Do not add explanations or extra text.
+"""
+
+        # 3. CALL MISTRAL
+        response = mistral_client.chat.complete(
+            model="mistral-large-latest",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3
         )
 
-        analysis_data = json.loads(response.text)
+        raw_output = response.choices[0].message.content
+        analysis_data = extract_json(raw_output)
 
-        # 6. SAVE TO DATABASE
+        # 4. SAVE TO DATABASE
         document = {
             "filename": resume_file.filename,
             "target_role": target_role,
             "analysis": analysis_data,
             "timestamp": datetime.datetime.utcnow()
         }
+
         await collection.insert_one(document)
 
         return {
@@ -100,45 +149,43 @@ async def analyze_skills(
         }
 
     except Exception as e:
-        print(f"Error: {e}")
+        print("Error:", e)
         return {"status": "error", "message": str(e)}
-# 1. NEW: Count of Queries Per Day
+
+# --------------------------------------------------
+# ANALYTICS ENDPOINTS
+# --------------------------------------------------
+
+# 1. Queries Per Day
 @app.get("/queries-per-day")
 async def get_queries_per_day():
-    # We fetch only the timestamps from MongoDB
     cursor = collection.find({}, {"timestamp": 1, "_id": 0})
     data = await cursor.to_list(length=1000)
-    
-    # Extract the date part (YYYY-MM-DD) from each timestamp
-    dates = [d["timestamp"].strftime("%Y-%m-%d") for d in data]
-    
-    # Count how many times each date appears
-    counts = Counter(dates)
-    
-    # Format for the Line/Bar Chart: [{"date": "2025-01-01", "count": 5}, ...]
-    formatted = [{"date": k, "count": v} for k, v in sorted(counts.items())]
-    return formatted
 
-# 2. Top Missing Skills (Remains but verified)
+    dates = [d["timestamp"].strftime("%Y-%m-%d") for d in data]
+    counts = Counter(dates)
+
+    return [{"date": k, "count": v} for k, v in sorted(counts.items())]
+
+# 2. Top Missing Skills
 @app.get("/top-missing-skills")
 async def get_missing_skills():
-    # Pull missing_skills from all documents
     cursor = collection.find({}, {"analysis.missing_skills": 1, "_id": 0})
     data = await cursor.to_list(length=100)
-    
-    # Flatten the list and count occurrences
-    all_missing = [skill for doc in data for skill in doc["analysis"]["missing_skills"]]
+
+    all_missing = [
+        skill
+        for doc in data
+        for skill in doc["analysis"]["missing_skills"]
+    ]
+
     counts = Counter(all_missing).most_common(5)
-    
+
     return [{"skill": k, "count": v} for k, v in counts]
 
-
-
-
-
-
-
-
+# --------------------------------------------------
+# RUN SERVER
+# --------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
